@@ -1,0 +1,45 @@
+# Tello Drone Configuration
+# This file controls the operational mode and behavior of the Tello drone system
+
+# API Provider Configuration
+# Choose between "gemini" or "openai" (OpenAI compatible API)
+api_provider: "openai" # or "openai"
+
+# Model Configuration
+# Specify the exact model name to use (overrides operational_mode defaults)
+# Leave empty to use operational_mode defaults
+model_name: "/workspace/smbu_zmq/models/Qwen2.5-VL-7B-Instruct" # vLLM served model name
+# model_name: "qwen3.6-27b"
+
+# Operational Mode Configuration
+# adaptive_mode: Original version with depth estimation and adaptive navigation
+# obstacle_mode: Enhanced version with obstacle detection and intensive keepalive
+operational_mode: "adaptive_mode" # Change to "obstacle_mode" for enhanced obstacle detection
+#operational_mode: "obstacle_mode"
+
+# Processing Configuration
+command_loop_delay: 2 # Delay in seconds between processing cycles
+show_vlm_decision_window: false # Save VLM selected point overlays without showing a live window
+
+# API Provider Options:
+#
+# gemini:
+#   - Requires: GEMINI_API_KEY
+#
+# openai:
+#   - Requires: OPENAI_API_KEY, OPENAI_BASE_URL (defaults to OpenRouter)
+#
+# Mode Descriptions (when model_name is empty):
+#
+# adaptive_mode:
+#   - Advanced depth estimation with non-linear scaling
+#   - Standard frame recording at 3fps
+#   - Basic error handling
+#   - Optimized for precise navigation with depth awareness
+#
+# obstacle_mode:
+#   - Enhanced obstacle detection with bounding boxes
+#   - Intensive keepalive system during API calls
+#   - Enhanced frame recording at 10fps
+#   - Advanced timeout protection and error recovery
+#   - Optimized for safe navigation with obstacle avoidance

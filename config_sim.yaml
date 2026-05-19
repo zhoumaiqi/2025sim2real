@@ -1,0 +1,41 @@
+# Simulator Navigation Configuration
+
+# API Provider Configuration
+# Choose between "gemini" or "openai" (OpenAI compatible API)
+api_provider: "gemini" # or "openai"
+
+# Model Configuration
+# Specify the exact model name to use
+# Leave empty to use default model for the provider
+model_name: "" # e.g., "gemini-2.5-flash", "gemini-2.5-pro", "openai/gpt-4.1"
+
+# Navigation Mode
+adaptive_mode: false # Enable adaptive depth-based movement (true/false)
+
+# Processing Configuration
+command_loop_delay: 0 # seconds between processing cycles
+
+# Display Configuration
+monitor: 1 # monitor index to capture (1=primary monitor)
+
+# Mode Descriptions:
+#
+# adaptive_mode: true
+#   - Uses depth estimation for variable movement speeds
+#   - Slow, precise movements for close objects
+#   - Fast, efficient movements for distant objects
+#   - Enhanced prompt asks VLM for depth information
+#
+# adaptive_mode: false
+#   - Uses obstacle detection mode
+#   - Fixed movement speeds for all distances
+#   - Focuses on obstacle avoidance
+#   - Enhanced prompt asks VLM for obstacle information
+
+# API Provider Options:
+#
+# gemini:
+#   - Requires: GEMINI_API_KEY
+#
+# openai:
+#   - Requires: OPENAI_API_KEY, OPENAI_BASE_URL (defaults to OpenRouter)
