@@ -8,7 +8,8 @@ api_provider: "openai" # or "openai"
 # Model Configuration
 # Specify the exact model name to use (overrides operational_mode defaults)
 # Leave empty to use operational_mode defaults
-model_name: "" # e.g., "gemini-2.5-flash", "gemini-2.5-pro", "openai/gpt-4.1"
+model_name: "/workspace/smbu_zmq/models/Qwen2.5-VL-7B-Instruct" # vLLM served model name
+# model_name: "qwen3.6-27b"
 
 # Operational Mode Configuration
 # adaptive_mode: Original version with depth estimation and adaptive navigation
@@ -18,6 +19,7 @@ operational_mode: "adaptive_mode" # Change to "obstacle_mode" for enhanced obsta
 
 # Processing Configuration
 command_loop_delay: 2 # Delay in seconds between processing cycles
+show_vlm_decision_window: false # Save VLM selected point overlays without showing a live window
 
 # API Provider Options:
 #

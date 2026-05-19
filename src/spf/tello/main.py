@@ -223,7 +223,9 @@ def main(args):
         test_image = cv2.cvtColor(test_image, cv2.COLOR_BGR2RGB)
 
         # Create controller with operational mode
-        controller = TelloController(mode=operational_mode)
+        controller = TelloController(
+            mode=operational_mode, enable_manual_override=False
+        )
 
         # Test instruction
         instruction = "navigate forward and slightly to the right to avoid obstacles"
@@ -240,7 +242,9 @@ def main(args):
     # Create controller with operational mode
     try:
         print(f"\nConnecting to Tello drone in {operational_mode}...")
-        tello_controller = TelloController(mode=operational_mode)
+        tello_controller = TelloController(
+            mode=operational_mode, enable_manual_override=False
+        )
     except Exception as e:
         print(f"Failed to connect to Tello: {e}")
         return 1
@@ -295,6 +299,7 @@ def main(args):
 
         print("\nStarting control loop...")
         print("Press Ctrl+C to exit")
+        print("Manual keyboard override is disabled while using text-command navigation.")
         print("\nMANUAL OVERRIDE CONTROLS:")
         print("  ↑/↓ (Arrow keys): Forward/Backward")
         print("  A/D: Turn left/right")

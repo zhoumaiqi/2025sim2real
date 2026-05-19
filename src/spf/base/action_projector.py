@@ -47,6 +47,7 @@ class ActionProjector:
 
         self.api_provider = config.get('api_provider', 'gemini')
         self.custom_model = config.get('model_name', '').strip()
+        self.show_vlm_decision_window = bool(config.get('show_vlm_decision_window', False))
 
         # Determine model name based on provider
         model_name = self._determine_model_name()
@@ -61,6 +62,10 @@ class ActionProjector:
         self.timestamp = time.strftime("%Y%m%d_%H%M%S")
         self.output_dir = f"action_visualizations/{self.timestamp}"
         os.makedirs(self.output_dir, exist_ok=True)
+        if self.show_vlm_decision_window:
+            cv2.namedWindow("SPF VLM Decision", cv2.WINDOW_NORMAL)
+            cv2.resizeWindow("SPF VLM Decision", 960, 720)
+            print("[VLM VIEW] Live decision window enabled")
 
     def _determine_model_name(self):
         """Determine model name based on provider and custom setting"""

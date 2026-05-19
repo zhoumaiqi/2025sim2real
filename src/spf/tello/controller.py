@@ -333,7 +333,7 @@ class RealtimeFrameProvider:
 
 
 class TelloController:
-    def __init__(self, mode="adaptive_mode"):
+    def __init__(self, mode="adaptive_mode", enable_manual_override=True):
         self.tello = Tello()  # Create Tello instance
         self.tello.connect()
         self.tello.streamon()
@@ -361,6 +361,7 @@ class TelloController:
         # Add manual control flag
         self.manual_control_active = False
         self.manual_key_pressed = None
+        self.enable_manual_override = enable_manual_override
 
         # Default speed settings
         self.default_speed = 100  # Default speed value
@@ -383,12 +384,14 @@ class TelloController:
         else:
             self.keepalive_active = False
 
-        # Start manual override keyboard listener
-        self.key_listener = Listener(
-            on_press=self._on_key_press, on_release=self._on_key_release
-        )
-        self.key_listener.daemon = True
-        self.key_listener.start()
+        # Start manual override keyboard listener only when enabled.
+        self.key_listener = None
+        if self.enable_manual_override:
+            self.key_listener = Listener(
+                on_press=self._on_key_press, on_release=self._on_key_release
+            )
+            self.key_listener.daemon = True
+            self.key_listener.start()
 
         # Map abstract actions to Tello RC control parameters (left_right, forward_backward, up_down, yaw)
         # Format: (left_right, forward_backward, up_down, yaw)

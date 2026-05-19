@@ -4,20 +4,163 @@ from ..base.action_projector import ActionProjector
 from ..base.drone_space import ActionPoint
 from .drone_space import TelloDroneActionSpace
 from typing import List, Tuple
-import os
 import time
 import json
+import re
+
+
+TELLO_CANDIDATE_RATIOS = [
+    (0.10, 0.30),
+    (0.30, 0.30),
+    (0.50, 0.30),
+    (0.70, 0.30),
+    (0.90, 0.30),
+    (0.10, 0.50),
+    (0.30, 0.50),
+    (0.50, 0.50),
+    (0.70, 0.50),
+    (0.90, 0.50),
+    (0.10, 0.70),
+    (0.30, 0.70),
+    (0.50, 0.70),
+    (0.70, 0.70),
+    (0.90, 0.70),
+]
+TELLO_DEFAULT_CANDIDATE_CHOICE = "P8"
+TELLO_DEFAULT_CANDIDATE_DEPTH = 6
+
+
+def _coerce_bool(value, default=False):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"true", "1", "yes"}:
+            return True
+        if lowered in {"false", "0", "no"}:
+            return False
+    if value is None:
+        return default
+    return bool(value)
+
+
+def _coerce_float(value, default=0.0):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def generate_tello_candidate_points(image):
+    height, width = image.shape[:2]
+    candidates = []
+    for idx, (x_ratio, y_ratio) in enumerate(TELLO_CANDIDATE_RATIOS, 1):
+        candidates.append(
+            {
+                "id": f"P{idx}",
+                "point": [int(round(y_ratio * 1000)), int(round(x_ratio * 1000))],
+                "pixel": (int(round(x_ratio * width)), int(round(y_ratio * height))),
+            }
+        )
+    return candidates
+
+
+def draw_tello_candidate_points(image, candidates, selected_id=None):
+    annotated = image.copy()
+    for candidate in candidates:
+        x, y = candidate["pixel"]
+        color = (0, 255, 0) if candidate["id"] == selected_id else (0, 255, 255)
+        cv2.circle(annotated, (x, y), 14, color, -1)
+        cv2.circle(annotated, (x, y), 14, (0, 0, 0), 2)
+        cv2.putText(
+            annotated,
+            candidate["id"],
+            (x + 18, y - 10),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (255, 255, 255),
+            2,
+        )
+    return annotated
+
+
+def parse_tello_candidate_selection(response_text, candidates):
+    valid_choices = {candidate["id"] for candidate in candidates}
+    parsed_choice = TELLO_DEFAULT_CANDIDATE_CHOICE
+    target_visible = False
+    confidence = 0.0
+    reason = "fallback"
+    fallback_used = False
+
+    try:
+        response_data = json.loads(response_text)
+        if isinstance(response_data, list):
+            response_data = response_data[0] if response_data else {}
+        if not isinstance(response_data, dict):
+            response_data = {}
+    except json.JSONDecodeError:
+        response_data = {}
+        choice_match = re.search(
+            r'"choice"\s*:\s*"(P\d+)"', response_text, re.IGNORECASE
+        )
+        visible_match = re.search(
+            r'"target_visible"\s*:\s*(true|false)', response_text, re.IGNORECASE
+        )
+        confidence_match = re.search(
+            r'"confidence"\s*:\s*([0-9]*\.?[0-9]+)', response_text
+        )
+        reason_match = re.search(r'"reason"\s*:\s*"([^"]+)"', response_text)
+        if choice_match:
+            response_data["choice"] = choice_match.group(1).upper()
+        if visible_match:
+            response_data["target_visible"] = visible_match.group(1).lower() == "true"
+        if confidence_match:
+            response_data["confidence"] = confidence_match.group(1)
+        if reason_match:
+            response_data["reason"] = reason_match.group(1)
+        fallback_used = True
+
+    raw_choice = str(
+        response_data.get("choice", TELLO_DEFAULT_CANDIDATE_CHOICE)
+    ).strip().upper()
+    if raw_choice in valid_choices:
+        parsed_choice = raw_choice
+    else:
+        parsed_choice = TELLO_DEFAULT_CANDIDATE_CHOICE
+        fallback_used = True
+
+    target_visible = _coerce_bool(response_data.get("target_visible"), default=False)
+    confidence = max(
+        0.0, min(1.0, _coerce_float(response_data.get("confidence"), default=0.0))
+    )
+    reason = str(response_data.get("reason", "fallback")).strip() or "fallback"
+
+    candidate = next(
+        (item for item in candidates if item["id"] == parsed_choice),
+        next(item for item in candidates if item["id"] == TELLO_DEFAULT_CANDIDATE_CHOICE),
+    )
+    return {
+        "candidate": candidate,
+        "choice": parsed_choice,
+        "target_visible": target_visible,
+        "confidence": confidence,
+        "reason": reason,
+        "fallback_used": fallback_used,
+    }
+
 
 class TelloActionProjector(ActionProjector):
     """
     Tello-specific action projector with mode-specific processing
     """
 
-    def __init__(self,
-                 image_width=960,
-                 image_height=720,
-                 mode="adaptive_mode",
-                 config_path="config_tello.yaml"):
+    def __init__(
+        self,
+        image_width=960,
+        image_height=720,
+        mode="adaptive_mode",
+        config_path="config_tello.yaml",
+    ):
         """
         Initialize the Tello projector with mode-specific settings
 
@@ -29,13 +172,15 @@ class TelloActionProjector(ActionProjector):
         """
         # Store operational mode FIRST (needed by parent's _determine_model_name)
         self.operational_mode = mode
-        
+
         super().__init__(image_width, image_height, config_path)
 
         # Use Tello-specific action space
         self.action_space = TelloDroneActionSpace(n_samples=8)
 
-        print(f"[TelloActionProjector] Initialized in {mode} with {self.api_provider} provider using model: {self.model_name}")
+        print(
+            f"[TelloActionProjector] Initialized in {mode} with {self.api_provider} provider using model: {self.model_name}"
+        )
 
     def _determine_model_name(self):
         """Determine model name based on provider, mode, and custom setting"""
@@ -54,53 +199,47 @@ class TelloActionProjector(ActionProjector):
             else:
                 return "gemini-2.0-flash"
 
-    def reverse_project_point(self, point_2d: Tuple[int, int], depth: float = 2) -> Tuple[float, float, float]:
+    def reverse_project_point(
+        self, point_2d: Tuple[int, int], depth: float = 2
+    ) -> Tuple[float, float, float]:
         """Project 2D image point back to 3D space with Tello-specific parameters"""
         # Set reference point at 35% from top of frame
         reference_y = self.image_height * 0.35
 
         # Center and normalize coordinates
-        x_normalized = (point_2d[0] - self.image_width/2) / (self.image_width/2)
-        y_normalized = (reference_y - point_2d[1]) / (self.image_height/2)
+        x_normalized = (point_2d[0] - self.image_width / 2) / (self.image_width / 2)
+        y_normalized = (reference_y - point_2d[1]) / (self.image_height / 2)
 
         # Adjust depth based on vertical position (closer if lower in image)
-        depth_factor = 1.0 + (y_normalized * 0.5)  # Adjust depth based on height
+        depth_factor = 1.0 + (y_normalized * 0.5)
         depth = depth * depth_factor
 
         # Calculate 3D coordinates with optimized depth
-        x = depth * x_normalized * np.tan(np.radians(self.fov_horizontal/2))
-        z = depth * y_normalized * np.tan(np.radians(self.fov_vertical/2))
+        x = depth * x_normalized * np.tan(np.radians(self.fov_horizontal / 2))
+        z = depth * y_normalized * np.tan(np.radians(self.fov_vertical / 2))
         y = depth
 
         return (x, y, z)
 
     def calculate_adjusted_depth(self, vlm_depth):
         """
-        Custom depth adjustment with specific rules:
-        - Depth <= 2: Use minimal depth for calculations but flag for yaw-only
-        - Depth > 2: Non-linear scaling for efficiency
-
-        Args:
-            vlm_depth: Depth value from VLM (1-10 scale)
-
-        Returns:
-            tuple: (adjusted_depth, yaw_only_flag)
+        Convert a nominal 1-10 depth score into a movement depth.
         """
         if vlm_depth <= 2:
-            # Very close objects - use minimal depth for calculations, but flag as yaw-only
-            adjusted_depth = 0.5  # Minimal depth to avoid calculation issues
-            yaw_only = True
-            print(f"Tello: VLM depth {vlm_depth}/10 → Adjusted depth {adjusted_depth} (YAW ONLY - too close)")
-            return adjusted_depth, yaw_only
-        else:  # vlm_depth > 2
-            # Far objects - non-linear scaling for efficiency
-            base = (vlm_depth / 10.0)**2.0 * 8
-            adjusted_depth = base
-            yaw_only = False
-            print(f"Tello: VLM depth {vlm_depth}/10 → Adjusted depth {adjusted_depth:.2f} (Normal movement)")
-            return adjusted_depth, yaw_only
+            adjusted_depth = 0.5
+            print(f"Tello: candidate depth {vlm_depth}/10 -> Adjusted depth {adjusted_depth}")
+            return adjusted_depth
 
-    def get_vlm_points(self, image: np.ndarray, instruction: str, tello_controller=None) -> List[ActionPoint]:
+        base = (vlm_depth / 10.0) ** 2.0 * 8
+        adjusted_depth = base
+        print(
+            f"Tello: candidate depth {vlm_depth}/10 -> Adjusted depth {adjusted_depth:.2f}"
+        )
+        return adjusted_depth
+
+    def get_vlm_points(
+        self, image: np.ndarray, instruction: str, tello_controller=None
+    ) -> List[ActionPoint]:
         """Use VLM to identify points based on current mode and API provider"""
         timestamp = time.strftime("%Y%m%d_%H%M%S")
 
@@ -112,6 +251,8 @@ class TelloActionProjector(ActionProjector):
             else:
                 actions = [self._get_single_action(image, instruction)]
 
+            actions = [action for action in actions if action is not None]
+
             if actions:
                 print("\n actions in visualization part:")
                 print("/n", actions)
@@ -121,12 +262,14 @@ class TelloActionProjector(ActionProjector):
 
                 # Draw points on image
                 for i, action in enumerate(actions, 1):
-                    # Draw point
-                    cv2.circle(viz_image,
-                              (int(action.screen_x), int(action.screen_y)),
-                              10, (0, 255, 0), -1)
+                    cv2.circle(
+                        viz_image,
+                        (int(action.screen_x), int(action.screen_y)),
+                        10,
+                        (0, 255, 0),
+                        -1,
+                    )
 
-                    # Add label
                     cv2.putText(
                         viz_image,
                         f"{i}: ({action.dx:.1f}, {action.dy:.1f}, {action.dz:.1f})",
@@ -134,57 +277,73 @@ class TelloActionProjector(ActionProjector):
                         cv2.FONT_HERSHEY_SIMPLEX,
                         0.7,
                         (255, 255, 255),
-                        2
+                        2,
                     )
 
-                    # Draw obstacles if present (obstacle_mode only)
-                    if (self.operational_mode == "obstacle_mode" and
-                        hasattr(action, 'detected_obstacles') and action.detected_obstacles):
+                    if (
+                        self.operational_mode == "obstacle_mode"
+                        and hasattr(action, "detected_obstacles")
+                        and action.detected_obstacles
+                    ):
                         for obstacle in action.detected_obstacles:
-                            if 'bounding_box' in obstacle:
-                                ymin, xmin, ymax, xmax = obstacle['bounding_box']
-                                # Draw rectangle for obstacle
-                                cv2.rectangle(viz_image,
-                                            (int(xmin), int(ymin)),
-                                            (int(xmax), int(ymax)),
-                                            (0, 0, 255), 2)  # Red color for obstacles
-                                # Add obstacle label
-                                label = obstacle.get('label', 'obstacle')
-                                cv2.putText(viz_image, label,
-                                        (int(xmin), int(ymin)-10),
-                                        cv2.FONT_HERSHEY_SIMPLEX, 0.7,
-                                        (0, 0, 255), 2)
+                            if "bounding_box" in obstacle:
+                                ymin, xmin, ymax, xmax = obstacle["bounding_box"]
+                                cv2.rectangle(
+                                    viz_image,
+                                    (int(xmin), int(ymin)),
+                                    (int(xmax), int(ymax)),
+                                    (0, 0, 255),
+                                    2,
+                                )
+                                label = obstacle.get("label", "obstacle")
+                                cv2.putText(
+                                    viz_image,
+                                    label,
+                                    (int(xmin), int(ymin) - 10),
+                                    cv2.FONT_HERSHEY_SIMPLEX,
+                                    0.7,
+                                    (0, 0, 255),
+                                    2,
+                                )
 
-                # Save visualization
                 save_path = f"{self.output_dir}/decision_{timestamp}.jpg"
                 cv2.imwrite(save_path, viz_image)
 
-                # Save decision data
                 decision_data = {
                     "timestamp": timestamp,
                     "mode": self.operational_mode,
                     "instruction": instruction,
-                    "actions": []
+                    "actions": [],
                 }
 
-                # Add action and obstacle data
                 for action in actions:
                     action_data = {
-                            "dx": action.dx,
-                            "dy": action.dy,
-                            "dz": action.dz,
-                            "screen_x": action.screen_x,
-                            "screen_y": action.screen_y
-                        }
+                        "dx": action.dx,
+                        "dy": action.dy,
+                        "dz": action.dz,
+                        "screen_x": action.screen_x,
+                        "screen_y": action.screen_y,
+                    }
 
-                    # Add obstacles if present (obstacle_mode only)
-                    if (self.operational_mode == "obstacle_mode" and
-                        hasattr(action, 'detected_obstacles') and action.detected_obstacles):
+                    if hasattr(action, "vlm_choice"):
+                        action_data["choice"] = action.vlm_choice
+                    if hasattr(action, "target_visible"):
+                        action_data["target_visible"] = action.target_visible
+                    if hasattr(action, "confidence"):
+                        action_data["confidence"] = action.confidence
+                    if hasattr(action, "fallback_used"):
+                        action_data["fallback_used"] = action.fallback_used
+
+                    if (
+                        self.operational_mode == "obstacle_mode"
+                        and hasattr(action, "detected_obstacles")
+                        and action.detected_obstacles
+                    ):
                         action_data["obstacles"] = action.detected_obstacles
 
                     decision_data["actions"].append(action_data)
 
-                with open(f"{self.output_dir}/decision_{timestamp}.json", 'w') as f:
+                with open(f"{self.output_dir}/decision_{timestamp}.json", "w") as f:
                     json.dump(decision_data, f, indent=2)
 
             return actions
@@ -193,19 +352,23 @@ class TelloActionProjector(ActionProjector):
             print(f"Error getting points: {e}")
             return []
 
-    def _get_single_action(self, image: np.ndarray, instruction: str, tello_controller=None) -> ActionPoint:
+    def _get_single_action(
+        self, image: np.ndarray, instruction: str, tello_controller=None
+    ) -> ActionPoint:
         """Get single next best action with mode-specific processing"""
 
         # Mode-specific processing
         if self.operational_mode == "obstacle_mode":
-            # Enhanced obstacle-aware processing
             print("\nFinished encoding image")
-            print(f"[{self.api_provider.upper()}] Preparing API call at {time.strftime('%H:%M:%S')}")
+            print(
+                f"[{self.api_provider.upper()}] Preparing API call at {time.strftime('%H:%M:%S')}"
+            )
             api_start_time = time.time()
 
-            # Ensure intensive keepalive is active right before the API call
             if tello_controller:
-                print(f"[{self.api_provider.upper()}] Confirming intensive keepalive before API call")
+                print(
+                    f"[{self.api_provider.upper()}] Confirming intensive keepalive before API call"
+                )
                 tello_controller.start_intensive_keepalive()
 
             prompt = f"""You are a drone navigation expert analyzing a drone camera view.
@@ -238,89 +401,99 @@ class TelloActionProjector(ActionProjector):
         - Aim for target's center.
         """
         else:
-            # Adaptive mode - original behavior
-            prompt = f"""You are a drone navigation expert analyzing a drone camera view.
+            candidates = generate_tello_candidate_points(image)
+            vlm_image = draw_tello_candidate_points(image, candidates)
+            debug_input_path = f"{self.output_dir}/debug_vlm_input.jpg"
+            cv2.imwrite(debug_input_path, vlm_image)
+            candidate_lines = "\n".join(
+                f'- {candidate["id"]}: [y, x] = {candidate["point"]}'
+                for candidate in candidates
+            )
 
-            Task: {instruction}
+            prompt = f"""no thought process, no explanations, only JSON output with the chosen candidate and its details.
+You are a drone navigation expert analyzing a drone camera view.
 
-            First, identify ALL objects in the image that match the description "{instruction}".
-            Then, select the MOST RELEVANT target object and place a single point DIRECTLY ON that object.
+Task: {instruction}
 
-            Return in this exact JSON format:
-            [{{"point": [y, x], "depth": depth_value, "label": "action description"}}]
+The image contains labeled candidate waypoints.
+Only choose one point from the labeled candidates.
+Do not output free coordinates.
 
-            Coordinate system:
-            - x: 0-1000 scale (500=center, >500=right, <500=left)
-            - y: 0-1000 scale (lower values=higher in image/sky)
-            - depth: 1-10 scale where:
-                * 1: Object is very close/large in frame
-                * 10: Object is far away/small in frame
+Return in this exact JSON format:
+{{"choice":"P8","target_visible":true,"confidence":0.9,"reason":"brief reason"}}
 
-            IMPORTANT:
-            - Place the point PRECISELY on the center of the target object
-            - Choose the largest/closest matching object if multiple exist
-            - Assess the depth based on how much of the frame the object occupies
-            - Your accuracy in point placement is critical for navigation success"""
+Valid choices and original [y, x] coordinates:
+{candidate_lines}
+
+IMPORTANT:
+- choice must be exactly one of P1 to P15
+- Never output free coordinates
+- If the target is visible, choose the candidate closest to the target direction
+- If the target is not visible, choose the most reasonable exploratory/search direction candidate
+- target_visible must be true only when the target is visible in the current image
+- confidence must be a number from 0.0 to 1.0
+- Keep reason under 12 words
+- Output only JSON, without markdown or extra text"""
 
         try:
-            # Get response from API
             if self.operational_mode == "obstacle_mode":
-                print(f"[{self.api_provider.upper()}] Sending API request at {time.strftime('%H:%M:%S')}")
-
-            response_text = self.vlm_client.generate_response(prompt, image)
+                print(
+                    f"[{self.api_provider.upper()}] Sending API request at {time.strftime('%H:%M:%S')}"
+                )
+                response_text = self.vlm_client.generate_response(prompt, image)
+            else:
+                response_text = self.vlm_client.generate_response(prompt, vlm_image)
 
             if self.operational_mode == "obstacle_mode":
                 api_duration = time.time() - api_start_time
-                print(f"[{self.api_provider.upper()}] Response received in {api_duration:.2f} seconds")
+                print(
+                    f"[{self.api_provider.upper()}] Response received in {api_duration:.2f} seconds"
+                )
 
-                # API call complete, can go back to normal keepalive if needed
                 if tello_controller:
                     tello_controller.stop_intensive_keepalive()
 
-            # Parse response text - handle potential markdown formatting
             from ..clients.vlm_client import VLMClient
+
             response_text = VLMClient.clean_response_text(response_text)
 
-            print(f"\n{self.api_provider.upper()} Response:")
+            print("\nraw_vlm_response:")
             print(response_text)
 
-            # Mode-specific JSON parsing
             if self.operational_mode == "obstacle_mode":
                 try:
-                    # Parse JSON response for obstacle mode
                     response_data = json.loads(response_text)
                     if not response_data:
                         raise ValueError("No data returned from VLM")
 
-                    # Convert normalized coordinates to pixel coordinates
-                    y, x = response_data['point']
+                    y, x = response_data["point"]
                     pixel_x = int((x / 1000.0) * self.image_width)
                     pixel_y = int((y / 1000.0) * self.image_height)
 
-                    # Project 2D point to 3D (obstacle mode uses default depth)
-                    x3d, y3d, z3d = self.reverse_project_point((pixel_x, pixel_y), depth=1.1)
-
-                    # Create ActionPoint
-                    action = ActionPoint(
-                        dx=x3d, dy=y3d, dz=z3d,
-                        action_type="move",
-                        screen_x=pixel_x,
-                        screen_y=pixel_y
+                    x3d, y3d, z3d = self.reverse_project_point(
+                        (pixel_x, pixel_y), depth=1.1
                     )
 
-                    # Add obstacles if present
-                    if 'obstacles' in response_data:
+                    action = ActionPoint(
+                        dx=x3d,
+                        dy=y3d,
+                        dz=z3d,
+                        action_type="move",
+                        screen_x=pixel_x,
+                        screen_y=pixel_y,
+                    )
+
+                    if "obstacles" in response_data:
                         obstacles = []
-                        for obstacle in response_data['obstacles']:
-                            if 'bounding_box' in obstacle:
-                                ymin, xmin, ymax, xmax = obstacle['bounding_box']
-                                # Convert to pixel coordinates if normalized
-                                if max(obstacle['bounding_box']) <= 1000:
+                        for obstacle in response_data["obstacles"]:
+                            if "bounding_box" in obstacle:
+                                ymin, xmin, ymax, xmax = obstacle["bounding_box"]
+                                if max(obstacle["bounding_box"]) <= 1000:
                                     xmin = int((xmin / 1000.0) * self.image_width)
                                     ymin = int((ymin / 1000.0) * self.image_height)
                                     xmax = int((xmax / 1000.0) * self.image_width)
                                     ymax = int((ymax / 1000.0) * self.image_height)
-                                obstacle['bounding_box'] = [ymin, xmin, ymax, xmax]
+                                obstacle["bounding_box"] = [ymin, xmin, ymax, xmax]
                             obstacles.append(obstacle)
                         action.detected_obstacles = obstacles
 
@@ -328,74 +501,105 @@ class TelloActionProjector(ActionProjector):
                     print(f"2D Normalized: ({x}, {y})")
                     print(f"2D Pixels: ({pixel_x}, {pixel_y})")
                     print(f"3D Vector: ({x3d:.2f}, {y3d:.2f}, {z3d:.2f})")
-                    if hasattr(action, 'detected_obstacles') and action.detected_obstacles:
+                    if (
+                        hasattr(action, "detected_obstacles")
+                        and action.detected_obstacles
+                    ):
                         print(f"Detected {len(action.detected_obstacles)} obstacles")
 
                     return action
 
                 except json.JSONDecodeError as json_error:
-                    print(f"[{self.api_provider.upper()}] Error parsing JSON: {json_error}")
-                    print(f"[{self.api_provider.upper()}] Raw response text: {response_text}")
+                    print(
+                        f"[{self.api_provider.upper()}] Error parsing JSON: {json_error}"
+                    )
+                    print(
+                        f"[{self.api_provider.upper()}] Raw response text: {response_text}"
+                    )
 
-                    # Try to manually extract the point information using regex
-                    import re
-                    point_match = re.search(r'"point":\s*\[(\d+),\s*(\d+)\]', response_text)
+                    point_match = re.search(
+                        r'"point":\s*\[(\d+),\s*(\d+)\]', response_text
+                    )
                     if point_match:
-                        print(f"[{self.api_provider.upper()}] Attempting fallback point extraction with regex")
+                        print(
+                            f"[{self.api_provider.upper()}] Attempting fallback point extraction with regex"
+                        )
                         y, x = int(point_match.group(1)), int(point_match.group(2))
                         pixel_x = int((x / 1000.0) * self.image_width)
                         pixel_y = int((y / 1000.0) * self.image_height)
-                        x3d, y3d, z3d = self.reverse_project_point((pixel_x, pixel_y), depth=1.1)
+                        x3d, y3d, z3d = self.reverse_project_point(
+                            (pixel_x, pixel_y), depth=1.1
+                        )
 
-                        # Create basic ActionPoint without obstacles
                         action = ActionPoint(
-                            dx=x3d, dy=y3d, dz=z3d,
+                            dx=x3d,
+                            dy=y3d,
+                            dz=z3d,
                             action_type="move",
                             screen_x=pixel_x,
-                            screen_y=pixel_y
+                            screen_y=pixel_y,
                         )
-                        print(f"[{self.api_provider.upper()}] Fallback action created: ({x3d:.2f}, {y3d:.2f}, {z3d:.2f})")
+                        print(
+                            f"[{self.api_provider.upper()}] Fallback action created: ({x3d:.2f}, {y3d:.2f}, {z3d:.2f})"
+                        )
                         return action
 
                     raise
             else:
-                # Adaptive mode - original JSON parsing with depth
-                points_data = json.loads(response_text)
-                if not points_data:
-                    raise ValueError("No points returned from VLM")
+                parsed_selection = parse_tello_candidate_selection(response_text, candidates)
+                selected_candidate = parsed_selection["candidate"]
+                parsed_choice = parsed_selection["choice"]
+                target_visible = parsed_selection["target_visible"]
+                confidence = parsed_selection["confidence"]
+                reason = parsed_selection["reason"]
+                fallback_used = parsed_selection["fallback_used"]
 
-                # Take first (and should be only) point
-                point_info = points_data[0]
+                selected_debug_path = f"{self.output_dir}/debug_vlm_selected.jpg"
+                cv2.imwrite(
+                    selected_debug_path,
+                    draw_tello_candidate_points(
+                        image, candidates, selected_id=selected_candidate["id"]
+                    ),
+                )
 
-                # Convert normalized coordinates to pixel coordinates
-                y, x = point_info['point']
-                pixel_x = int((x / 1000.0) * self.image_width)
-                pixel_y = int((y / 1000.0) * self.image_height)
+                y, x = selected_candidate["point"]
+                pixel_x, pixel_y = selected_candidate["pixel"]
 
-                # Get depth from VLM's response (default to 4 if not provided)
-                vlm_depth = point_info.get('depth', 4)
+                adjusted_depth = self.calculate_adjusted_depth(
+                    TELLO_DEFAULT_CANDIDATE_DEPTH
+                )
+                x3d, y3d, z3d = self.reverse_project_point(
+                    (pixel_x, pixel_y), depth=adjusted_depth
+                )
 
-                # Use the new depth adjustment that returns both depth and yaw-only flag
-                adjusted_depth, yaw_only = self.calculate_adjusted_depth(vlm_depth)
-
-                # Project 2D point to 3D with custom depth
-                x3d, y3d, z3d = self.reverse_project_point((pixel_x, pixel_y), depth=adjusted_depth)
-
-                # Create ActionPoint with yaw_only flag
                 action = ActionPoint(
-                    dx=x3d, dy=y3d, dz=z3d,
+                    dx=x3d,
+                    dy=y3d,
+                    dz=z3d,
                     action_type="move",
                     screen_x=pixel_x,
                     screen_y=pixel_y,
-                    yaw_only=yaw_only  # Set the yaw-only flag based on depth
                 )
+                action.vlm_choice = parsed_choice
+                action.target_visible = target_visible
+                action.confidence = confidence
+                action.fallback_used = fallback_used
 
-                print(f"\nIdentified single action: {point_info['label']}")
+                print(f"parsed_choice: {parsed_choice}")
+                print(f"target_visible: {target_visible}")
+                print(f"confidence: {confidence:.2f}")
+                print(f"selected_pixel: ({pixel_x}, {pixel_y})")
+                print(f"fallback_used: {fallback_used}")
+                print(f"selected_reason: {reason}")
+                print(f"Saved candidate input image: {debug_input_path}")
+                print(f"Saved candidate selection image: {selected_debug_path}")
+
+                print(f"\nIdentified single action: {selected_candidate['id']} - {reason}")
                 print(f"2D Normalized: ({x}, {y})")
                 print(f"2D Pixels: ({pixel_x}, {pixel_y})")
-                print(f"Depth estimation: {vlm_depth}/10 (adjusted to {adjusted_depth:.2f})")
-                if yaw_only:
-                    print(f"[SAFETY] YAW ONLY mode - object too close for forward movement")
+                print(
+                    f"Depth estimation: {TELLO_DEFAULT_CANDIDATE_DEPTH}/10 (adjusted to {adjusted_depth:.2f})"
+                )
                 print(f"3D Vector: ({x3d:.2f}, {y3d:.2f}, {z3d:.2f})")
 
                 return action
@@ -403,7 +607,7 @@ class TelloActionProjector(ActionProjector):
         except Exception as e:
             if self.operational_mode == "obstacle_mode":
                 print(f"[{self.api_provider.upper()}] Error in API call: {e}")
-                if 'response_text' in locals():
+                if "response_text" in locals():
                     print(f"[{self.api_provider.upper()}] Full response:")
                     print(response_text)
                 else:
@@ -411,6 +615,6 @@ class TelloActionProjector(ActionProjector):
             else:
                 print(f"Error in single action mode: {e}")
                 print("Full response:")
-                if 'response_text' in locals():
+                if "response_text" in locals():
                     print(response_text)
             return None

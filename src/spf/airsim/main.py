@@ -6,11 +6,18 @@ Uses AirSim API for image capture, depth estimation, and LLM-based command proce
 
 import os
 import time
+from pathlib import Path
 import cv2
 import numpy as np
 import airsim
 
 from .controller import AirSimController
+
+
+CONFIG_PATH = Path(__file__).resolve().parents[3] / "config_airsim.yaml"
+MAX_VALID_DEPTH_M = 30.0
+AIRSIM_INVALID_DEPTH_VALUE = 65504.0
+AIRSIM_INVALID_DEPTH_EPSILON = 1.0
 
 
 def check_camera_settings(client, camera_name="0"):
@@ -106,6 +113,92 @@ def capture_airsim_image(client, camera_name="0"):
         return 640, 480
 
 
+def capture_airsim_rgb_depth(client, camera_name="0"):
+    """Capture RGB and float depth from AirSim without normalizing depth values."""
+    try:
+        responses = client.simGetImages(
+            [
+                airsim.ImageRequest(camera_name, airsim.ImageType.Scene, False, False),
+                airsim.ImageRequest(
+                    camera_name, airsim.ImageType.DepthPerspective, True, False
+                ),
+            ]
+        )
+
+        if len(responses) < 2:
+            print("Error: Missing RGB/depth response from AirSim")
+            return None, None
+
+        rgb_response = responses[0]
+        depth_response = responses[1]
+
+        if rgb_response.height == 0 or rgb_response.width == 0:
+            print(
+                f"Error: Invalid RGB dimensions {rgb_response.width}x{rgb_response.height}"
+            )
+            return None, None
+
+        img1d = np.frombuffer(rgb_response.image_data_uint8, dtype=np.uint8)
+        img_bgr = img1d.reshape(rgb_response.height, rgb_response.width, 3)
+
+        depth_image = _decode_depth_response(depth_response)
+        return img_bgr, depth_image
+
+    except Exception as e:
+        print(f"Error capturing AirSim RGB/depth image: {e}")
+        return None, None
+
+
+def _decode_depth_response(depth_response):
+    try:
+        print("Raw depth image type: DepthPerspective float")
+
+        if depth_response.height == 0 or depth_response.width == 0:
+            print(
+                f"Raw depth shape: invalid {depth_response.width}x{depth_response.height}"
+            )
+            return None
+
+        depth_data = np.array(depth_response.image_data_float, dtype=np.float32)
+        expected_size = depth_response.height * depth_response.width
+        if depth_data.size != expected_size:
+            print(
+                f"Raw depth shape: invalid data size {depth_data.size}, expected {expected_size}"
+            )
+            return None
+
+        depth_image = depth_data.reshape(depth_response.height, depth_response.width)
+        _log_raw_depth_stats(depth_image)
+        return depth_image
+
+    except Exception as e:
+        print(f"Error decoding AirSim depth image: {e}")
+        return None
+
+
+def _log_raw_depth_stats(depth_image):
+    print(f"Raw depth shape: {depth_image.shape}")
+    finite_mask = np.isfinite(depth_image)
+    positive_mask = depth_image > 0
+    below_max_mask = depth_image < MAX_VALID_DEPTH_M
+    not_airsim_invalid_mask = (
+        np.abs(depth_image - AIRSIM_INVALID_DEPTH_VALUE) > AIRSIM_INVALID_DEPTH_EPSILON
+    )
+    valid_mask = finite_mask & positive_mask & below_max_mask & not_airsim_invalid_mask
+    valid = depth_image[valid_mask]
+    valid_ratio = valid.size / depth_image.size if depth_image.size else 0.0
+    if valid.size == 0:
+        print("Raw depth min/max/median: unavailable")
+    else:
+        print(
+            "Raw depth min/max/median: "
+            f"{float(np.min(valid)):.2f}/"
+            f"{float(np.max(valid)):.2f}/"
+            f"{float(np.median(valid)):.2f}"
+        )
+    print(f"Valid depth ratio: {valid_ratio:.3f}")
+
+
 def main(args):
     """Main entrypoint for AirSim mode"""
 
@@ -122,11 +215,12 @@ def main(args):
         try:
             import yaml
 
-            with open("config_airsim.yaml", "r") as f:
+            with open(CONFIG_PATH, "r") as f:
                 config = yaml.safe_load(f)
                 adaptive_mode = config.get("adaptive_mode", True)
         except Exception as e:
             print(f"Config loading failed, using default adaptive mode: {e}")
+            config = {"adaptive_mode": True}
             adaptive_mode = True
 
         image_height, image_width = test_image.shape[:2]
@@ -157,7 +251,7 @@ def main(args):
     try:
         import yaml
 
-        with open("config_airsim.yaml", "r") as f:
+        with open(CONFIG_PATH, "r") as f:
             config = yaml.safe_load(f)
             adaptive_mode = config.get("adaptive_mode", True)
             camera_name = config.get("camera_name", "0")
@@ -168,9 +262,14 @@ def main(args):
     except Exception as e:
         print(f"Error loading config: {e}")
         print("Using default configuration")
-        command_loop_delay = 0
-        adaptive_mode = True
-        camera_name = "0"
+        config = {
+            "adaptive_mode": True,
+            "camera_name": "0",
+            "command_loop_delay": 0,
+        }
+        adaptive_mode = config["adaptive_mode"]
+        camera_name = config["camera_name"]
+        command_loop_delay = config["command_loop_delay"]
 
     airsim_controller = None
     try:
@@ -215,14 +314,21 @@ def main(args):
             else:
                 airsim_controller.wait_for_queue_empty()
 
-            frame = capture_airsim_image(client, camera_name)
+            frame, depth_image = capture_airsim_rgb_depth(client, camera_name)
 
             if frame is None:
                 print("Error: Failed to capture image from AirSim")
                 time.sleep(1)
                 continue
 
-            response = airsim_controller.process_spatial_command(frame, current_command)
+            try:
+                drone_pose = client.simGetVehiclePose()
+            except Exception:
+                drone_pose = None
+
+            response = airsim_controller.process_spatial_command(
+                frame, current_command, depth_image=depth_image, drone_pose=drone_pose
+            )
             print(f"\nAction Response:\n{response}\n")
 
             time.sleep(command_loop_delay)

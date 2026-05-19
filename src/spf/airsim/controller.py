@@ -149,10 +149,26 @@ class AirSimController:
         self.client.takeoffAsync().join()
         print("Takeoff complete")
 
-    def process_spatial_command(self, current_frame, instruction: str):
+    def _get_drone_pose_safe(self):
+        try:
+            return self.client.simGetVehiclePose()
+        except Exception:
+            return None
+
+    def process_spatial_command(
+        self, current_frame, instruction: str, depth_image=None, drone_pose=None
+    ):
         """Process command using spatial understanding system"""
         try:
-            actions = self.action_projector.get_vlm_points(current_frame, instruction)
+            if drone_pose is None:
+                drone_pose = self._get_drone_pose_safe()
+
+            actions = self.action_projector.get_vlm_points(
+                current_frame,
+                instruction,
+                depth_image=depth_image,
+                drone_pose=drone_pose,
+            )
 
             if not actions:
                 return "No valid actions identified"
