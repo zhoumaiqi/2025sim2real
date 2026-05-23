@@ -44,10 +44,11 @@ class ActionProjector:
         # Load configuration
         with open(config_path, 'r') as f:
             config = yaml.safe_load(f)
+        self.config = config or {}
 
-        self.api_provider = config.get('api_provider', 'gemini')
-        self.custom_model = config.get('model_name', '').strip()
-        self.show_vlm_decision_window = bool(config.get('show_vlm_decision_window', False))
+        self.api_provider = self.config.get('api_provider', 'gemini')
+        self.custom_model = self.config.get('model_name', '').strip()
+        self.show_vlm_decision_window = bool(self.config.get('show_vlm_decision_window', False))
 
         # Determine model name based on provider
         model_name = self._determine_model_name()

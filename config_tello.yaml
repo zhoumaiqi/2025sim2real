@@ -21,6 +21,24 @@ operational_mode: "adaptive_mode" # Change to "obstacle_mode" for enhanced obsta
 command_loop_delay: 2 # Delay in seconds between processing cycles
 show_vlm_decision_window: false # Save VLM selected point overlays without showing a live window
 
+# Remote Depth Pro Configuration (phase-1 safety filtering for adaptive_mode)
+depth_pro:
+  enabled: true
+  endpoint: "http://10.50.0.43:8765/infer"
+  timeout_seconds: 5.0
+  candidate_window: 9
+  roi_center_x_ratio: 0.50
+  roi_center_y_ratio: 0.72
+  roi_width_ratio: 0.24
+  roi_height_ratio: 0.18
+  min_safe_depth_m: 1.0
+  max_valid_depth_m: 30.0
+  front_risk_threshold_m: 1.0
+  inject_depth_safety_into_prompt: false
+  reduce_forward_on_front_risk: true
+  clamp_downward_on_front_risk: true
+  min_motion_depth_m: 0.6
+
 # API Provider Options:
 #
 # gemini:

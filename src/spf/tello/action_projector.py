@@ -2,11 +2,19 @@ import cv2
 import numpy as np
 from ..base.action_projector import ActionProjector
 from ..base.drone_space import ActionPoint
+from ..clients import RemoteDepthProClient
 from .drone_space import TelloDroneActionSpace
 from typing import List, Tuple
 import time
 import json
 import re
+from .depth_safety import (
+    UNKNOWN,
+    apply_front_risk_to_motion,
+    attach_depth_safety,
+    format_depth_prompt_hint,
+    replace_blocked_candidate,
+)
 
 
 TELLO_CANDIDATE_RATIOS = [
@@ -65,11 +73,20 @@ def generate_tello_candidate_points(image):
     return candidates
 
 
-def draw_tello_candidate_points(image, candidates, selected_id=None):
+def draw_tello_candidate_points(image, candidates, selected_id=None, status_lines=None):
     annotated = image.copy()
     for candidate in candidates:
         x, y = candidate["pixel"]
-        color = (0, 255, 0) if candidate["id"] == selected_id else (0, 255, 255)
+        safety = candidate.get("safety", UNKNOWN)
+        if candidate["id"] == selected_id:
+            color = (0, 255, 0)
+        elif safety == "blocked":
+            color = (80, 80, 255)
+        elif safety == "safe":
+            color = (0, 255, 255)
+        else:
+            color = (180, 180, 180)
+
         cv2.circle(annotated, (x, y), 14, color, -1)
         cv2.circle(annotated, (x, y), 14, (0, 0, 0), 2)
         cv2.putText(
@@ -81,6 +98,36 @@ def draw_tello_candidate_points(image, candidates, selected_id=None):
             (255, 255, 255),
             2,
         )
+        cv2.putText(
+            annotated,
+            safety,
+            (x + 18, y + 12),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.35,
+            (255, 255, 255),
+            1,
+        )
+    if status_lines:
+        for index, line in enumerate(status_lines):
+            y = 28 + index * 24
+            cv2.putText(
+                annotated,
+                line,
+                (16, y),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (0, 0, 0),
+                3,
+            )
+            cv2.putText(
+                annotated,
+                line,
+                (16, y),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (255, 255, 255),
+                1,
+            )
     return annotated
 
 
@@ -177,10 +224,18 @@ class TelloActionProjector(ActionProjector):
 
         # Use Tello-specific action space
         self.action_space = TelloDroneActionSpace(n_samples=8)
+        self.depth_client = RemoteDepthProClient.from_config(
+            self.config.get("depth_pro")
+        )
 
         print(
             f"[TelloActionProjector] Initialized in {mode} with {self.api_provider} provider using model: {self.model_name}"
         )
+        if self.depth_client is not None:
+            print(
+                "[TelloActionProjector] Remote Depth Pro enabled: "
+                f"{self.depth_client.endpoint}"
+            )
 
     def _determine_model_name(self):
         """Determine model name based on provider, mode, and custom setting"""
@@ -333,6 +388,18 @@ class TelloActionProjector(ActionProjector):
                         action_data["confidence"] = action.confidence
                     if hasattr(action, "fallback_used"):
                         action_data["fallback_used"] = action.fallback_used
+                    if hasattr(action, "depth_front_risk"):
+                        action_data["depth_front_risk"] = action.depth_front_risk
+                    if hasattr(action, "depth_safety_source"):
+                        action_data["depth_safety_source"] = action.depth_safety_source
+                    if hasattr(action, "depth_original_choice"):
+                        action_data["depth_original_choice"] = action.depth_original_choice
+                    if hasattr(action, "depth_final_choice"):
+                        action_data["depth_final_choice"] = action.depth_final_choice
+                    if hasattr(action, "depth_choice_replaced"):
+                        action_data["depth_choice_replaced"] = action.depth_choice_replaced
+                    if hasattr(action, "depth_adjusted_m"):
+                        action_data["depth_adjusted_m"] = action.depth_adjusted_m
 
                     if (
                         self.operational_mode == "obstacle_mode"
@@ -402,13 +469,34 @@ class TelloActionProjector(ActionProjector):
         """
         else:
             candidates = generate_tello_candidate_points(image)
+            depth_result = None
+            depth_state = {
+                "available": False,
+                "front_risk": False,
+                "roi_median_m": None,
+            }
+            if self.depth_client is not None:
+                depth_result = self.depth_client.infer(
+                    image,
+                    candidate_ratios=TELLO_CANDIDATE_RATIOS,
+                )
+                depth_state = attach_depth_safety(candidates, depth_result)
+                self._log_depth_state(candidates, depth_state)
+            else:
+                attach_depth_safety(candidates, None)
             vlm_image = draw_tello_candidate_points(image, candidates)
             debug_input_path = f"{self.output_dir}/debug_vlm_input.jpg"
             cv2.imwrite(debug_input_path, vlm_image)
-            candidate_lines = "\n".join(
-                f'- {candidate["id"]}: [y, x] = {candidate["point"]}'
-                for candidate in candidates
-            )
+            if self.depth_client is not None and self.depth_client.inject_depth_safety_into_prompt:
+                candidate_lines = format_depth_prompt_hint(
+                    candidates,
+                    front_risk=depth_state["front_risk"],
+                )
+            else:
+                candidate_lines = "\n".join(
+                    f'- {candidate["id"]}: [y, x] = {candidate["point"]}'
+                    for candidate in candidates
+                )
 
             prompt = f"""no thought process, no explanations, only JSON output with the chosen candidate and its details.
 You are a drone navigation expert analyzing a drone camera view.
@@ -554,11 +642,32 @@ IMPORTANT:
                 reason = parsed_selection["reason"]
                 fallback_used = parsed_selection["fallback_used"]
 
+                original_choice = selected_candidate["id"]
+                depth_choice_replaced = False
+                depth_replacement_reason = "depth_disabled"
+                if self.depth_client is not None:
+                    (
+                        selected_candidate,
+                        depth_choice_replaced,
+                        depth_replacement_reason,
+                    ) = replace_blocked_candidate(selected_candidate, candidates)
+
                 selected_debug_path = f"{self.output_dir}/debug_vlm_selected.jpg"
+                status_lines = [
+                    f"Depth available: {depth_state['available']}",
+                    f"Front risk: {depth_state['front_risk']}",
+                    f"Original choice: {original_choice}",
+                    f"Final choice: {selected_candidate['id']}",
+                    f"Depth replace: {depth_choice_replaced}",
+                    f"Reason: {depth_replacement_reason}",
+                ]
                 cv2.imwrite(
                     selected_debug_path,
                     draw_tello_candidate_points(
-                        image, candidates, selected_id=selected_candidate["id"]
+                        image,
+                        candidates,
+                        selected_id=selected_candidate["id"],
+                        status_lines=status_lines,
                     ),
                 )
 
@@ -571,6 +680,24 @@ IMPORTANT:
                 x3d, y3d, z3d = self.reverse_project_point(
                     (pixel_x, pixel_y), depth=adjusted_depth
                 )
+                front_risk_forward_reduced = False
+                front_risk_downward_clamped = False
+                if self.depth_client is not None:
+                    adjusted_depth, z3d, front_risk_forward_reduced, front_risk_downward_clamped = (
+                        apply_front_risk_to_motion(
+                            adjusted_depth=adjusted_depth,
+                            z3d=z3d,
+                            front_risk=depth_state["front_risk"],
+                            reduce_forward_on_front_risk=self.depth_client.reduce_forward_on_front_risk,
+                            clamp_downward_on_front_risk=self.depth_client.clamp_downward_on_front_risk,
+                            min_motion_depth_m=self.depth_client.min_motion_depth_m,
+                        )
+                    )
+                    x3d, y3d, z3d = self.reverse_project_point(
+                        (pixel_x, pixel_y), depth=adjusted_depth
+                    )
+                    if front_risk_downward_clamped and z3d < 0:
+                        z3d = 0.0
 
                 action = ActionPoint(
                     dx=x3d,
@@ -584,6 +711,13 @@ IMPORTANT:
                 action.target_visible = target_visible
                 action.confidence = confidence
                 action.fallback_used = fallback_used
+                action.depth_front_risk = depth_state["front_risk"]
+                action.depth_safety_source = "remote_depth_pro" if depth_state["available"] else "none"
+                action.depth_original_choice = original_choice
+                action.depth_final_choice = selected_candidate["id"]
+                action.depth_choice_replaced = depth_choice_replaced
+                action.depth_replacement_reason = depth_replacement_reason
+                action.depth_adjusted_m = adjusted_depth
 
                 print(f"parsed_choice: {parsed_choice}")
                 print(f"target_visible: {target_visible}")
@@ -591,6 +725,15 @@ IMPORTANT:
                 print(f"selected_pixel: ({pixel_x}, {pixel_y})")
                 print(f"fallback_used: {fallback_used}")
                 print(f"selected_reason: {reason}")
+                print(f"depth_front_risk: {depth_state['front_risk']}")
+                print(f"depth_choice_replaced: {depth_choice_replaced}")
+                print(f"depth_replacement_reason: {depth_replacement_reason}")
+                print(
+                    f"front_risk_forward_reduced: {front_risk_forward_reduced}"
+                )
+                print(
+                    f"front_risk_downward_clamped: {front_risk_downward_clamped}"
+                )
                 print(f"Saved candidate input image: {debug_input_path}")
                 print(f"Saved candidate selection image: {selected_debug_path}")
 
@@ -618,3 +761,18 @@ IMPORTANT:
                 if "response_text" in locals():
                     print(response_text)
             return None
+
+    def _log_depth_state(self, candidates, depth_state):
+        print("[DepthPro] candidate safety:")
+        for candidate in candidates:
+            print(
+                f"  {candidate['id']}: "
+                f"depth={candidate.get('depth')} "
+                f"safety={candidate.get('safety')}"
+            )
+        print(
+            "[DepthPro] summary: "
+            f"available={depth_state['available']} "
+            f"front_risk={depth_state['front_risk']} "
+            f"roi_median_m={depth_state['roi_median_m']}"
+        )
