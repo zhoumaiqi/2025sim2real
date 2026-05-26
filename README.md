@@ -100,9 +100,10 @@ Tello 部分当前定位是“实机初步验证”，不要把它理解成已�
 当前状态更接近“干净的基线控制链路 + 小步修正”，而不是复杂安全层：
 
 - `adaptive_mode` 目前是默认配置，已经接入 `P1~P15` 候选点约束。
-- 这里的 `P1~P15` 主要用于约束 VLM 选点，减少自由点漂移。
+- `adaptive_mode` 还接入了远程 `Depth Pro` 轻量安全层：会给候选点打 `safe / blocked / unknown` 标记，前方风险高时优先替换 `blocked` 点，并收缩前向 / 下向动作幅度。
+- `inject_depth_safety_into_prompt` 默认关闭，所以深度信息主要用于后处理，不是直接接管 VLM 输出。
 - 这不等同于 AirSim 那套完整的深度安全、记忆导航和状态切换机制。
-- Tello 当前没有接入 AirSim 那样的实时深度安全过滤。
+- Tello 当前仍没有接入 AirSim 那种本地深度闭环。
 - Tello 当前也没有接入 AirSim 的 `TargetMemory / SearchMemory / IEVE-Lite` 主线逻辑。
 
 与用户实际飞行体验更相关的几个点：
@@ -312,11 +313,13 @@ OPENAI_BASE_URL=https://openrouter.ai/api/v1
 - `operational_mode`
 - `command_loop_delay`
 - `show_vlm_decision_window`
+- `depth_pro`
 
 说明：
 
 - 当前默认 `operational_mode: adaptive_mode`。
 - `adaptive_mode` 更接近当前 README 所描述的“候选点约束基线”。
+- `depth_pro` 是 `adaptive_mode` 下的远程安全过滤配置；`enabled`、`endpoint`、`front_risk_threshold_m`、`reduce_forward_on_front_risk`、`clamp_downward_on_front_risk` 是最关键的参数。
 - `obstacle_mode` 仍在代码里，但应视为实验性分支，不要混同于默认实机方案。
 
 ### 7.3 `.env`
@@ -384,6 +387,7 @@ uv run spf tello --video --video-session test_run
 说明：
 
 - 程序会读取 `config_tello.yaml`。
+- 如果 `depth_pro.enabled: true`，`adaptive_mode` 会在每轮选点前调用远程 Depth Pro，并据此做候选点替换和动作限幅；服务不可用时会退化为无深度安全层。
 - 启动后需要手动输入初始自然语言命令。
 - 飞行过程中还支持动态输入新命令。
 - 实机功能仍在实验阶段，请务必在安全环境下测试，并随时准备接管或降落。
@@ -463,7 +467,7 @@ uv run python src/spf_tools/depth_pro_test.py \
 - 自由点输出原本容易漂移，因此当前才重新收缩到候选点约束；但 Tello 候选点方案本身也仍在调试。
 - Tello 的高度 / 垂直控制不稳定，实机阶段应谨慎对待上下动作。
 - AirSim 已有较完整的候选点安全过滤与轻量记忆逻辑，但这些能力并没有等价迁移到 Tello。
-- `Depth Pro` 当前没有接入实时飞控。
+- `Depth Pro` 已接入 Tello 的 `adaptive_mode` 安全层，但当前只作为远程候选点过滤与动作限幅，不是通用实时飞控控制器。
 - `SearchMemory` 目前不直接控制最终动作，主要用于统计、日志和下一帧的弱提示。
 - 当前代码仍属于实验性研究代码，不宜直接当作稳定产品使用。
 
